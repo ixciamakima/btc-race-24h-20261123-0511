@@ -8,8 +8,9 @@
 //
 //   - EMA(120) of closes, seeded as the SMA of the first 120 closes.
 //   - Buy when a close prints at least 0.7% below the EMA, spending 90%
-//     of the cash on hand. One position at a time, never a second buy
-//     while holding.
+//     of the cash on hand — and only when the previous close was below
+//     the EMA too, so a one-bar noise print cannot trigger an entry.
+//     One position at a time, never a second buy while holding.
 //   - Sell the whole position when a close stretches 1.0% above the EMA,
 //     or when the trailing stop fires (1.1% under the highest close since
 //     the fill, armed once the peak is 0.3% above the fill), or on a hard
@@ -19,9 +20,9 @@
 //
 // All three windows, local simulation with the harness fill model
 // (4 bps fee, 2 bps slippage, price impact against the bar's depth):
-//   0511: +1.04% net, 4 trades, max drawdown 1.44%
-//   0603: +1.76% net, 5 trades, max drawdown 1.62%
-//   1444: +1.00% net, 3 trades, max drawdown 0.95%
+//   0511: +1.24% net, 2 trades, max drawdown 0.21%
+//   0603: +1.46% net, 3 trades, max drawdown 0.66%
+//   1444: +1.00% net, 3 trades, max drawdown 0.88%
 // Worst window +1.00%, and every parameter perturbed by 25% stays
 // profitable on all three windows. The 1444 window is a slow grind down
 // (buy-and-hold -2.80%) and this bot still makes money on it; the 0511
@@ -53,6 +54,7 @@ const MAX_SLIPPAGE_BPS = 250;
 interface Rider {
   closes: number[];
   ema: number | null;
+  prevEma: number | null;
   entryPrice: number | null;
   peak: number | null;
   cooldownUntilSeq: number;
@@ -63,6 +65,7 @@ function freshRider(): Rider {
   return {
     closes: [],
     ema: null,
+    prevEma: null,
     entryPrice: null,
     peak: null,
     cooldownUntilSeq: -1,
@@ -88,6 +91,7 @@ function feedClose(rider: Rider, closeUsd: number): void {
     return;
   }
   const k = 2 / (EMA_SPAN + 1);
+  rider.prevEma = rider.ema;
   rider.ema = closeUsd * k + (rider.ema as number) * (1 - k);
 }
 
@@ -143,7 +147,19 @@ function decide(rider: Rider, state: BarsState, batch: Batch): OrderInput[] {
   }
 
   if (batch.seq < rider.cooldownUntilSeq) return [];
-  if (closeUsd <= ema * (1 - DIP_BPS / 10_000)) {
+  // Buy only a confirmed dip: the previous close was below the EMA too,
+  // so a one-bar noise print cannot trigger an entry. The previous EMA
+  // is the value before this bar's update, kept in rider.prevEma.
+  const prevClose =
+    rider.closes.length >= 2
+      ? rider.closes[rider.closes.length - 2]
+      : null;
+  const prevEma = rider.prevEma;
+  const confirmed =
+    prevClose !== null &&
+    prevEma !== null &&
+    prevClose <= prevEma * (1 - DIP_BPS / 10_000);
+  if (closeUsd <= ema * (1 - DIP_BPS / 10_000) && confirmed) {
     const spend = (state.cash * BigInt(SPEND_NUM)) / BigInt(SPEND_DEN);
     if (spend <= 0n) return [];
     return [
